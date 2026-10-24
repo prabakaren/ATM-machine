@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATM Simulation System</title>
+<style>
+  :root{
+    --bezel:#d9dde1; --bezel-dark:#aab1b8; --screen:#16233f; --screen-2:#1f3158;
+    --ink:#f3ead6; --amber:#ffb84d; --ok:#8fe3a8; --err:#ff8a7a; --key:#f5f6f7; --text:#1d232b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
+    background:#eef0f2;font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif;color:var(--text)}
+  .atm{width:min(760px,100%);background:var(--bezel);border-radius:22px;padding:22px;
+    border:2px solid var(--bezel-dark);box-shadow:0 18px 40px rgba(30,40,60,.18)}
+  .atm h1{font-size:1rem;margin:0 0 14px;font-weight:700;letter-spacing:.02em}
+  .screen{background:var(--screen);color:var(--ink);border-radius:12px;padding:22px;min-height:330px;
+    border:6px solid #8b939b;display:flex;flex-direction:column;gap:14px}
+  .screen h2{margin:0;font-size:1.25rem;font-weight:600;color:var(--amber)}
+  .msg{min-height:22px;font-size:.95rem}
+  .msg.err{color:var(--err)} .msg.ok{color:var(--ok)}
+  label{font-size:.85rem;opacity:.85;display:block;margin-bottom:4px}
+  input{width:100%;padding:11px 12px;border-radius:8px;border:1px solid #4b5f8c;background:var(--screen-2);
+    color:var(--ink);font-size:1.05rem}
+  input:focus,button:focus-visible{outline:3px solid var(--amber);outline-offset:2px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .menu{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:12px 14px;font-weight:600;
+    background:var(--amber);color:#2a1d00}
+  button.alt{background:var(--screen-2);color:var(--ink);border:1px solid #4b5f8c}
+  button:hover{filter:brightness(1.08)}
+  .balance{font-size:2.2rem;font-weight:700;color:var(--ink)}
+  table{width:100%;border-collapse:collapse;font-size:.88rem}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #34476f}
+  td.amt{text-align:right;font-variant-numeric:tabular-nums}
+  .wrap{max-height:210px;overflow:auto}
+  .hint{font-size:.8rem;opacity:.7}
+  .tools{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+  .tools button{background:var(--key);color:var(--text);border:1px solid var(--bezel-dark);padding:8px 12px;font-size:.85rem}
+  @media(max-width:520px){.row,.menu{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main class="atm">
+  <h1>ATM Simulation System</h1>
+  <section class="screen" id="screen" aria-live="polite"></section>
+  <div class="tools">
+    <button id="export">Save data to file</button>
+    <button id="import">Load data from file</button>
+    <button id="reset">Reset demo data</button>
+    <input type="file" id="file" accept="application/json" hidden>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+/* ---------- Custom exceptions (exception handling) ---------- */
+class ATMError extends Error { constructor(m){ super(m); this.name = this.constructor.name; } }
+class InvalidPinError extends ATMError {}
+class AccountLockedError extends ATMError {}
+class InvalidAmountError extends ATMError {}
+class InsufficientFundsError extends ATMError {}
+class AccountNotFoundError extends ATMError {}
+
+/* ---------- Transaction ---------- */
+class Transaction {
+  constructor(type, amount, balanceAfter, date = new Date().toISOString()) {
+    this.type = type; this.amount = amount; this.balanceAfter = balanceAfter; this.date = date;
+  }
+}
+
+/* ---------- Account (encapsulation with private fields) ---------- */
+class Account {
+  #pin; #balance; #failedAttempts; #locked; #history;
+  static MAX_ATTEMPTS = 3;
+
+  constructor(number, holder, pin, balance = 0) {
+    this.number = number;
+    this.holder = holder;
+    this.#pin = String(pin);
+    this.#balance = balance;
+    this.#failedAttempts = 0;
+    this.#locked = false;
+    this.#history = [];                       // collection: array of Transaction
+  }
+
+  get balance() { return this.#balance; }
+  get locked() { return this.#locked; }
+  get history() { return [...this.#history]; } // copy, so outside code cannot mutate it
+
+  verifyPin(pin) {
+    if (this.#locked) throw new AccountLockedError("Account is locked. Contact your bank.");
+    if (String(pin) !== this.#pin) {
+      this.#failedAttempts++;
+      if (this.#failedAttempts >= Account.MAX_ATTEMPTS) {
+        this.#locked = true;
+        throw new AccountLockedError("Too many wrong PINs. Account locked.");
+      }
+      throw new InvalidPinError(`Wrong PIN. ${Account.MAX_ATTEMPTS - this.#failedAttempts} attempt(s) left.`);
+    }
+    this.#failedAttempts = 0;
+    return true;
+  }
+
+  deposit(amount) {
+    this.#validate(amount);
+    this.#balance += amount;
+    this.#record("Deposit", amount);
+  }
+
+  withdraw(amount) {
+    this.#validate(amount);
+    if (amount % 100 !== 0) throw new InvalidAmountError("Withdraw in multiples of 100.");
+    if (amount > this.#balance) throw new InsufficientFundsError("Insufficient balance.");
+    this.#balance -= amount;
+    this.#record("Withdrawal", amount);
+  }
+
+  changePin(oldPin, newPin) {
+    this.verifyPin(oldPin);
+    if (!/^\d{4}$/.test(newPin)) throw new InvalidPinError("New PIN must be exactly 4 digits.");
+    this.#pin = newPin;
+  }
+
+  #validate(amount) {
+    if (!Number.isFinite(amount) || amount <= 0) throw new InvalidAmountError("Enter an amount greater than 0.");
+  }
+  #record(type, amount) { this.#history.push(new Transaction(type, amount, this.#balance)); }
+
+  /* serialization for file handling */
+  toJSON() {
+    return { number: this.number, holder: this.holder, pin: this.#pin, balance: this.#balance,
+             locked: this.#locked, history: this.#history };
+  }
+  static fromJSON(o) {
+    const a = new Account(o.number, o.holder, o.pin, o.balance);
+    a.#locked = !!o.locked;
+    a.#history = (o.history || []).map(t => new Transaction(t.type, t.amount, t.balanceAfter, t.date));
+    return a;
+  }
+}
+
+/* ---------- ATM (holds accounts in a Map, handles sessions and persistence) ---------- */
+class ATM {
+  static KEY = "atm-simulation-data";
+  #accounts = new Map();                      // collection: accountNumber -> Account
+  #current = null;
+
+  constructor() { this.load(); }
+
+  seed() {
+    this.#accounts.clear();
+    [new Account("1001", "Asha Raman", "1234", 5000),
+     new Account("1002", "Kiran Dev", "4321", 12000)]
+      .forEach(a => this.#accounts.set(a.number, a));
+    this.save();
+  }
+
+  login(number, pin) {
+    const acc = this.#accounts.get(number);
+    if (!acc) throw new AccountNotFoundError("Account number not found.");
+    try { acc.verifyPin(pin); }
+    finally { this.save(); }                  // persist failed attempts / lock state
+    this.#current = acc;
+  }
+  logout() { this.#current = null; }
+  get account() {
+    if (!this.#current) throw new ATMError("Please log in first.");
+    return this.#current;
+  }
+  get loggedIn() { return this.#current !== null; }
+
+  /* ---- file handling: localStorage + JSON file export/import ---- */
+  save() { localStorage.setItem(ATM.KEY, JSON.stringify([...this.#accounts.values()])); }
+  load() {
+    try {
+      const raw = localStorage.getItem(ATM.KEY);
+      if (!raw) return this.seed();
+      this.#fromArray(JSON.parse(raw));
+    } catch { this.seed(); }
+  }
+  #fromArray(arr) {
+    this.#accounts = new Map(arr.map(o => [o.number, Account.fromJSON(o)]));
+  }
+  exportFile() {
+    const blob = new Blob([JSON.stringify([...this.#accounts.values()], null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "atm-data.json"; a.click();
+    URL.revokeObjectURL(a.href);
+  }
+  async importFile(file) {
+    try {
+      this.#fromArray(JSON.parse(await file.text()));
+      this.#current = null; this.save();
+    } catch { throw new ATMError("That file is not valid ATM data."); }
+  }
+}
+
+/* ---------- UI ---------- */
+const atm = new ATM();
+const screen = document.getElementById("screen");
+const money = n => "₹" + n.toLocaleString("en-IN");
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+function say(text, kind = "") {
+  const m = document.getElementById("msg");
+  if (m) { m.textContent = text; m.className = "msg " + kind; }
+}
+/* Runs an action and turns any ATMError into an on-screen message */
+function attempt(fn, okText) {
+  try { fn(); atm.save(); if (okText) say(okText, "ok"); return true; }
+  catch (e) {
+    if (e instanceof ATMError) { say(e.message, "err"); return false; }
+    throw e;
+  }
+}
+
+function viewLogin() {
+  screen.innerHTML = `
+    <h2>Welcome. Insert your card details.</h2>
+    <div class="row">
+      <div><label for="acc">Account number</label><input id="acc" inputmode="numeric" value="1001"></div>
+      <div><label for="pin">4-digit PIN</label><input id="pin" type="password" inputmode="numeric" maxlength="4"></div>
+    </div>
+    <div class="msg" id="msg"></div>
+    <button id="go">Log in</button>
+    <p class="hint">Demo accounts: 1001 (PIN 1234) and 1002 (PIN 4321). Three wrong PINs lock an account.</p>`;
+  const go = () => {
+    const ok = attempt(() => atm.login(document.getElementById("acc").value.trim(),
+                                       document.getElementById("pin").value));
+    if (ok) viewMenu();
+  };
+  document.getElementById("go").onclick = go;
+  document.getElementById("pin").onkeydown = e => { if (e.key === "Enter") go(); };
+}
+
+function viewMenu(note = "") {
+  const a = atm.account;
+  screen.innerHTML = `
+    <h2>Hello, ${esc(a.holder)}. What would you like to do?</h2>
+    <div class="msg ok" id="msg">${note}</div>
+    <div class="menu">
+      <button data-v="balance">Check balance</button>
+      <button data-v="withdraw">Withdraw cash</button>
+      <button data-v="deposit">Deposit cash</button>
+      <button data-v="history">Transaction history</button>
+      <button data-v="pin" class="alt">Change PIN</button>
+      <button data-v="out" class="alt">Log out</button>
+    </div>`;
+  screen.querySelectorAll("[data-v]").forEach(b => b.onclick = () => ({
+    balance: viewBalance, withdraw: () => viewAmount("withdraw"), deposit: () => viewAmount("deposit"),
+    history: viewHistory, pin: viewPin, out: () => { atm.logout(); viewLogin(); }
+  })[b.dataset.v]());
+}
+
+const backBtn = `<button class="alt" id="back">Back to menu</button>`;
+const wireBack = () => document.getElementById("back").onclick = () => viewMenu();
+
+function viewBalance() {
+  screen.innerHTML = `<h2>Available balance</h2><div class="balance">${money(atm.account.balance)}</div>${backBtn}`;
+  wireBack();
+}
+
+function viewAmount(kind) {
+  const w = kind === "withdraw";
+  screen.innerHTML = `
+    <h2>${w ? "Withdraw cash" : "Deposit cash"}</h2>
+    <div><label for="amt">Amount in rupees${w ? " (multiples of 100)" : ""}</label>
+    <input id="amt" type="number" min="1" inputmode="numeric"></div>
+    <div class="msg" id="msg"></div>
+    <div class="row"><button id="do">${w ? "Withdraw" : "Deposit"}</button>${backBtn}</div>`;
+  wireBack();
+  document.getElementById("do").onclick = () => {
+    const amount = Number(document.getElementById("amt").value);
+    const ok = attempt(() => w ? atm.account.withdraw(amount) : atm.account.deposit(amount));
+    if (ok) viewMenu(`${w ? "Withdrew" : "Deposited"} ${money(amount)}. New balance: ${money(atm.account.balance)}.`);
+  };
+}
+
+function viewHistory() {
+  const rows = atm.account.history.slice(-10).reverse().map(t => `
+    <tr><td>${new Date(t.date).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})}</td>
+    <td>${t.type}</td><td class="amt">${money(t.amount)}</td><td class="amt">${money(t.balanceAfter)}</td></tr>`).join("");
+  screen.innerHTML = `
+    <h2>Last 10 transactions</h2>
+    ${rows ? `<div class="wrap"><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Balance</th></tr></thead><tbody>${rows}</tbody></table></div>`
+           : `<p>No transactions yet. Make a deposit or withdrawal to see it here.</p>`}
+    ${backBtn}`;
+  wireBack();
+}
+
+function viewPin() {
+  screen.innerHTML = `
+    <h2>Change PIN</h2>
+    <div class="row">
+      <div><label for="o">Current PIN</label><input id="o" type="password" maxlength="4" inputmode="numeric"></div>
+      <div><label for="n">New PIN</label><input id="n" type="password" maxlength="4" inputmode="numeric"></div>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div class="row"><button id="do">Save new PIN</button>${backBtn}</div>`;
+  wireBack();
+  document.getElementById("do").onclick = () => {
+    const ok = attempt(() => atm.account.changePin(document.getElementById("o").value, document.getElementById("n").value));
+    if (ok) viewMenu("PIN changed.");
+    else if (atm.account.locked) { atm.logout(); viewLogin(); say("Account locked.", "err"); }
+  };
+}
+
+/* file tools */
+const fileInput = document.getElementById("file");
+document.getElementById("export").onclick = () => atm.exportFile();
+document.getElementById("import").onclick = () => fileInput.click();
+fileInput.onchange = async () => {
+  try { await atm.importFile(fileInput.files[0]); viewLogin(); say("Data loaded from file.", "ok"); }
+  catch (e) { say(e.message, "err"); }
+  fileInput.value = "";
+};
+document.getElementById("reset").onclick = () => { atm.logout(); atm.seed(); viewLogin(); say("Demo data restored.", "ok"); };
+
+viewLogin();
+</script>
+</body>
+</html>
